@@ -36,8 +36,8 @@ if command -v nginx >/dev/null 2>&1; then
     fi
 else
     echo "[*] Nginx chưa được cài đặt. Tiến hành cài đặt..."
-    apt-get update -qq
-    apt-get install -y -qq nginx curl > /dev/null
+    sudo apt update -qq
+    sudo apt install -y -qq nginx curl > /dev/null
 fi
 
 echo "[*] Cập nhật cấu hình Nginx tối ưu cho benchmark..."
