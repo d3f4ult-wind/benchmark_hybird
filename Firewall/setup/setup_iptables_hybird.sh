@@ -64,6 +64,9 @@ fi
 # Tạo ipset (xóa nếu đã tồn tại để reset)
 # ─────────────────────────────────────────
 echo "[*] Khởi tạo ipset..."
+# ipset không thể xóa vì iptables cũ đang dùng, nên xóa rules cũ trước, sau đó xóa ipset nếu tồn tại
+iptables -F
+iptables -X
 ipset destroy "$BLACKLIST_SET" 2>/dev/null || true
 ipset destroy "$WHITELIST_SET" 2>/dev/null || true
 
