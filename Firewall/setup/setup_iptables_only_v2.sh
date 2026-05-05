@@ -20,7 +20,7 @@
 #   (Không có XDP DROP sớm ở driver level — đây chính là điểm cần đo)
 #
 # Các thay đổi so với phiên bản trước (lý do ghi trong comment inline):
-#   1. JUNK_RULES chỉ áp dụng cho packet KHÔNG phải ESTABLISHED/RELATED
+#   1. Đã bỏ JUNK_RULES, đưa ICMP DROP lên đầu FORWARD chain.
 #   2. Bỏ tcp_syncookies=0 (confounding factor so với hybrid)
 #   3. Bỏ nf_conntrack_max override (hybrid không set, giữ đồng nhất)
 #   4. Gộp hai lần flush iptables thành một
@@ -40,8 +40,7 @@ IFACE_OUT="${IFACE_OUT:-enp0s9}"   # Interface nhìn về Victim   (giống hybr
 
 # Whitelist: CHỈ gồm các IP client hợp lệ — KHÔNG có .100 (attacker ICMP flood).
 # Trong hybrid, .100 bị XDP DROP trước khi chạm iptables nên dù hybrid có .100
-# trong whitelist cũng vô hại. Ở đây không có XDP nên .100 phải bị JUNK_RULES
-# chặn theo đúng kịch bản Phase 1.
+# trong whitelist cũng vô hại. Ở đây không có XDP nên .100 bị chặn trực tiếp ở iptables.
 WHITELIST_IPS=(
     "10.10.1.10"    # netns ns10 — client hợp lệ
     "10.10.1.11"    # netns ns11 — client hợp lệ
@@ -50,7 +49,7 @@ WHITELIST_IPS=(
 
 # IP attacker ICMP flood (Phase 1).
 # Trong hybrid: bị XDP DROP ở driver level.
-# Ở đây: đi vào kernel stack đầy đủ, duyệt qua JUNK_RULES, mới bị DROP.
+# Ở đây: đi vào kernel stack đầy đủ, bị chặn ở FORWARD chain.
 ICMP_FLOOD_IP="10.10.1.100"
 
 # Ngưỡng phát hiện SYN flood — giữ nguyên như hybrid để so sánh công bằng
@@ -59,12 +58,6 @@ SYN_BURST=30
 
 BLACKLIST_SET="ipt_only_blacklist"  # Tên khác để tránh conflict nếu chạy cùng máy
 WHITELIST_SET="ipt_only_whitelist"
-
-# Số rule rác cần nạp vào iptables (tương đương 999 junk entry trong XDP BPF map)
-JUNK_RULE_COUNT=999
-
-# Dải IP rác — giống generate_xdp_rules.py: dùng 172.16.0.0/12
-JUNK_BASE="172.16"
 
 LOG_PREFIX="[IPT-ONLY] "  # Prefix khác với hybrid để phân biệt trong dmesg/syslog
 
@@ -127,7 +120,7 @@ iptables -t mangle -X
 iptables -t nat -F
 iptables -t nat -X
 
-iptables -P INPUT   ACCEPT
+iptables -P INPUT  ACCEPT
 iptables -P FORWARD ACCEPT
 iptables -P OUTPUT  ACCEPT
 
@@ -194,39 +187,6 @@ iptables -A AUTO_BLACKLIST -p tcp --syn \
     -m recent --name "ipt_only_syn" --rcheck --seconds 5 --hitcount 50 --rsource \
     -j DROP
 
-# Chain JUNK_RULES — tương đương 999 XDP junk entry + 1 rule thật.
-# Đây là trái tim của benchmark: buộc iptables duyệt O(n) qua 1000 entry
-# trong khi hybrid dùng BPF LPM Trie O(log n).
-iptables -N JUNK_RULES
-
-# ─────────────────────────────────────────
-# Nạp 999 rule rác vào chain JUNK_RULES
-# ─────────────────────────────────────────
-echo "[*] Nạp $JUNK_RULE_COUNT rule rác vào JUNK_RULES chain..."
-echo "    (Tương đương 999 junk entry trong XDP BPF map của hybrid)"
-
-count=0
-for second_octet in $(seq 16 31); do
-    for third_octet in $(seq 0 255); do
-        if [[ $count -ge $JUNK_RULE_COUNT ]]; then
-            break 2
-        fi
-        subnet="${JUNK_BASE}.${second_octet}.${third_octet}/24"
-        iptables -A JUNK_RULES -s "$subnet" -j DROP
-        (( count++ )) || true # Đếm số rule đã nạp, in thông báo mỗi 100 rule
-        if (( count % 100 == 0 )); then
-            echo "    → Đã nạp $count/$JUNK_RULE_COUNT rule..."
-        fi
-    done
-done
-
-# Rule thật cuối JUNK_RULES: DROP ICMP flood từ .100 (Phase 1).
-# Đây là điểm khác biệt mấu chốt so với hybrid:
-#   Hybrid : packet .100 bị XDP DROP ở driver level, KHÔNG vào kernel stack
-#   Ở đây  : packet .100 đi qua toàn bộ kernel stack, duyệt 999 rule rác, mới bị DROP
-# → CPU overhead, IRQ, và conntrack pressure sẽ cao hơn đáng kể → đây là điều cần đo.
-iptables -A JUNK_RULES -s "$ICMP_FLOOD_IP" -p icmp -j DROP
-echo "    [+] Đã nạp $count rule rác + 1 rule thật DROP ICMP từ $ICMP_FLOOD_IP"
 
 # ─────────────────────────────────────────
 # Cấu hình FORWARD chain chính
@@ -237,28 +197,9 @@ echo "[*] Cấu hình FORWARD chain..."
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A INPUT -i "$IFACE_IN" -p tcp --dport 22 -j ACCEPT
 
-# FIX 4 (quan trọng nhất): Thứ tự ESTABLISHED/RELATED trước JUNK_RULES.
-#
-# Phiên bản trước đặt JUNK_RULES TRƯỚC ESTABLISHED/RELATED, nghĩa là mọi reply
-# packet từ victim về client .10 (Phase 2) cũng phải duyệt qua 999 rule rác.
-# Điều này tạo ra overhead không có trong hybrid vì XDP chỉ filter inbound từ
-# IFACE_IN, còn reply traffic từ IFACE_OUT đi thẳng qua ACCEPT.
-#
-# Tuy nhiên đặt ESTABLISHED trước HOÀN TOÀN cũng không đúng vì lần đầu tiên
-# một connection NEW đến (ICMP flood, SYN flood) vẫn phải qua JUNK_RULES.
-# Giải pháp: JUNK_RULES chỉ áp dụng cho packet có ctstate NEW (hoặc INVALID),
-# packet ESTABLISHED/RELATED bypass thẳng — đây là hành vi tương đương nhất
-# với hybrid vì XDP không có khái niệm connection tracking.
-#
-# Trình tự đúng:
-#   1. ESTABLISHED/RELATED → ACCEPT ngay (shortcut, không qua JUNK_RULES)
-#   2. BLACKLIST_CHECK      → DROP nếu đã bị blacklist
-#   3. JUNK_RULES           → DROP rác + ICMP flood (chỉ áp dụng cho NEW)
-#   4. STATEFUL_DETECT      → Phát hiện SYN flood từ whitelist
-#   5. AUTO_BLACKLIST       → Chặn IP đã tấn công
-#   6. ACCEPT whitelist     → HTTP/HTTPS từ .10, .11, .50
-#   7. ICMP whitelist       → ping từ whitelist
-#   8. DROP mặc định        → tất cả còn lại
+# BƯỚC 0: DROP ICMP flood từ .100 (Phase 1)
+# Đặt ở đầu chain, trước cả ESTABLISHED/RELATED.
+iptables -A FORWARD -i "$IFACE_IN" -s "$ICMP_FLOOD_IP" -p icmp -j DROP
 
 # Bước 1: ESTABLISHED/RELATED bypass toàn bộ chain phía dưới
 iptables -A FORWARD -i "$IFACE_IN" \
@@ -268,43 +209,34 @@ iptables -A FORWARD -i "$IFACE_IN" \
 # Bước 2: Dynamic blacklist (IP bị phát hiện tấn công SYN flood sẽ vào đây)
 iptables -A FORWARD -i "$IFACE_IN" -j BLACKLIST_CHECK
 
-# Bước 3: JUNK_RULES — chỉ áp dụng cho NEW connections (và INVALID).
-# Dùng --ctstate NEW để đảm bảo reply packet không bị duyệt qua 999 rule.
-# ICMP flood từ .100 là NEW (stateless), SYN flood từ .50 là NEW → đều vào đây.
-iptables -A FORWARD -i "$IFACE_IN" \
-    -m conntrack --ctstate NEW \
-    -j JUNK_RULES
-
-# Bước 4: Phát hiện SYN flood từ whitelist (Phase 3).
-# .50 đi qua JUNK_RULES mà không bị DROP (vì .50 không nằm trong 172.16.x.x
-# và không phải ICMP flood), sau đó vào đây để kiểm tra hashlimit.
+# Bước 3: Phát hiện SYN flood từ whitelist (Phase 3).
 iptables -A FORWARD -i "$IFACE_IN" \
     -m set --match-set "$WHITELIST_SET" src \
     -p tcp --syn \
     -j STATEFUL_DETECT
 
-# Bước 5: Auto-blacklist threshold check
+# Bước 4: Auto-blacklist threshold check
 iptables -A FORWARD -i "$IFACE_IN" -j AUTO_BLACKLIST
 
-# Bước 6: Cho phép HTTP/HTTPS từ whitelist (mô phỏng service cần bảo vệ)
+# Bước 5: Cho phép HTTP/HTTPS từ whitelist (mô phỏng service cần bảo vệ)
 iptables -A FORWARD -i "$IFACE_IN" \
     -p tcp -m multiport --dports 80,443,8080 \
     -m conntrack --ctstate NEW \
     -m set --match-set "$WHITELIST_SET" src \
     -j ACCEPT
 
-# Bước 7: Cho phép ICMP từ whitelist (để test connectivity từ .10, .11)
+# Bước 6: Cho phép ICMP từ whitelist (để test connectivity từ .10, .11)
 iptables -A FORWARD -i "$IFACE_IN" \
     -p icmp --icmp-type echo-request \
     -m set --match-set "$WHITELIST_SET" src \
     -j ACCEPT
 
-# Bước 8: Log + DROP tất cả còn lại
+# Bước 7: Log + DROP tất cả còn lại
 iptables -A FORWARD -i "$IFACE_IN" \
     -j LOG --log-prefix "${LOG_PREFIX}DROP-DEFAULT " --log-level 4
 iptables -A FORWARD -i "$IFACE_IN" -j DROP
 
-# Cho phép reply traffic từ Victim đi ngược lại (không qua JUNK_RULES)
+# Cho phép reply traffic từ Victim đi ngược lại
 iptables -A FORWARD -i "$IFACE_OUT" -j ACCEPT
 
 # ─────────────────────────────────────────
@@ -319,8 +251,7 @@ echo "[+] Cấu hình iptables-only hoàn tất!"
 echo ""
 echo "    Tóm tắt:"
 echo "    - Chế độ         : iptables-only (KHÔNG có XDP)"
-echo "    - Junk rules     : $count (duyệt tuyến tính O(n), trong JUNK_RULES chain)"
-echo "    - Rule thật ICMP : DROP ICMP từ $ICMP_FLOOD_IP (cuối JUNK_RULES)"
+echo "    - Rule thật ICMP : DROP trực tiếp ICMP từ $ICMP_FLOOD_IP (Đầu chain FORWARD)"
 echo "    - Blacklist set  : $BLACKLIST_SET (dynamic, ban đầu rỗng)"
 echo "    - Whitelist set  : $WHITELIST_SET (${#WHITELIST_IPS[@]} IPs: ${WHITELIST_IPS[*]})"
 echo "    - SYN threshold  : $SYN_RATE_LIMIT (burst: $SYN_BURST)"
@@ -328,12 +259,11 @@ echo ""
 echo "    Các điều kiện đã đồng nhất với hybrid:"
 echo "    - tcp_syncookies : KHÔNG override (dùng mặc định kernel)"
 echo "    - conntrack_max  : KHÔNG override (dùng mặc định kernel)"
-echo "    - ESTABLISHED/RELATED bypass JUNK_RULES (reply traffic không bị overhead)"
+echo "    - ESTABLISHED/RELATED bypass phần lớn rule (nhưng sau ICMP DROP)"
 echo "    - 10.10.1.100 NGOÀI whitelist (đúng vai trò attacker Phase 1)"
 echo ""
 echo "    Điểm khác biệt cốt lõi so với hybrid (đây là điều benchmark đo được):"
-echo "    - ICMP flood (.100) đi vào kernel stack đầy đủ trước khi bị DROP"
-echo "    - 999 junk rules duyệt O(n) thay vì BPF LPM Trie O(log n)"
-echo "    - Conntrack phải tiếp nhận mọi NEW packet trước khi JUNK_RULES drop"
+echo "    - ICMP flood (.100) đi vào kernel stack đầy đủ trước khi bị DROP ở iptables FORWARD"
+echo "    - Conntrack phải tiếp nhận mọi NEW packet trước khi chặn hoặc chuyển tiếp"
 echo ""
 echo "    Tiếp theo: sudo bash run_benchmark_iptables_only.sh"
